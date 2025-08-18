@@ -14,6 +14,7 @@
 
 #include "runtime/core/pipeline.h"
 
+#include <algorithm>
 #include <limits>
 #include <optional>
 #include <queue>
@@ -32,11 +33,14 @@
 #include "litert/cc/litert_macros.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
 #include "runtime/components/sampler.h"
+#include "runtime/components/scoring_cpu_util.h"
 #include "runtime/components/stop_token_detector.h"
 #include "runtime/components/tokenizer.h"
+#include "runtime/components/top_p_cpu_sampler.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/executor/llm_executor.h"
 #include "runtime/executor/llm_executor_io_types.h"
+#include "runtime/proto/sampler_params.pb.h"
 #include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/litert_status_util.h"
 #include "runtime/util/status_macros.h"  //NOLINT
@@ -139,7 +143,6 @@ class DecodeOneStep {
 
     auto decoded_result =
         tokenizer_.TokenIdsToTexts(num_output_candidates_, token_ids);
-
     for (int i = 0; i < num_output_candidates_; ++i) {
       result_text_[i] = "";
       if (Tokenizer::IsIncompleteBpeSequence(decoded_result.value()[i])) {
@@ -179,6 +182,52 @@ class DecodeOneStep {
   absl::Span<float> GetScores() { return scores_span_; }
 
   const std::vector<std::string>& GetResultText() const { return result_text_; }
+
+  absl::StatusOr<std::vector<float>> computeConfidencesForBatch(
+      const std::vector<int> sampled_id, litert::TensorBuffer* decoded_ids) {
+    if (sampler_.has_value()) {
+      TopPSampler* top_p_sampler = dynamic_cast<TopPSampler*>(sampler_.value());
+      if (top_p_sampler == nullptr) {
+        return absl::InternalError(
+            "getBatchPerplexity is only supported for external sampling.");
+      }
+      // Overwrite the decoded_ids with the text id for the input text.
+      LITERT_ASSIGN_OR_RETURN(auto duplicate_decoded_ids,
+                              decoded_ids->Duplicate());
+      ExecutorInputs inputs(ExecutorTextData(std::move(duplicate_decoded_ids)),
+                            std::nullopt, std::nullopt);
+      // Decoding section.
+      if (benchmark_info_.has_value()) {
+        RETURN_IF_ERROR(benchmark_info_->TimeMarkDelta("executor_decode"));
+      }
+      ASSIGN_OR_RETURN(auto output_logits, executor_.DecodeLogits(inputs));
+      if (benchmark_info_.has_value()) {
+        RETURN_IF_ERROR(benchmark_info_->TimeMarkDelta("executor_decode"));
+      }
+      float temperature = top_p_sampler->getTemperature();
+      decoded_ids->Write(absl::MakeConstSpan(sampled_id));
+
+      auto logits_data_or = ReferTensorBufferAsSpan<float>(output_logits);
+      absl::Span<float> logits_data;
+      std::vector<float> logits_data_buffer;
+      if (!logits_data_or) {  // Download the data if it is not in host memory.
+        LITERT_ASSIGN_OR_RETURN(auto logits_size, output_logits.PackedSize());
+        if (logits_data_buffer.size() != logits_size / sizeof(float)) {
+          logits_data_buffer = std::vector<float>(logits_size / sizeof(float));
+        }
+        TensorBuffer& mutable_logits_tensor =
+            const_cast<TensorBuffer&>(output_logits);
+        mutable_logits_tensor.Read(absl::MakeSpan(logits_data_buffer));
+        logits_data = absl::MakeSpan(logits_data_buffer);
+      } else {
+        logits_data = logits_data_or.Value();
+      }
+      return ComputeBatchConfidences(logits_data, sampled_id, temperature);
+    } else {
+      return absl::InternalError(
+          "getBatchPerplexity is only supported for external sampling.");
+    }
+  }
 
  private:
   // Runs the core decoding and sampling step, for either internal or external
@@ -349,6 +398,67 @@ absl::StatusOr<Responses> DecodeLoop(
 }
 
 }  // namespace
+
+absl::StatusOr<std::vector<float>> ScoreCustomSampling(
+    LlmExecutor& executor, Tokenizer& tokenizer,
+    const StopTokenDetector& stop_token_detector,
+    const std::vector<absl::string_view>& target_texts, Sampler& sampler,
+    litert::TensorBuffer& decoded_ids) {
+  TopPSampler* top_p_sampler = dynamic_cast<TopPSampler*>(&sampler);
+  if (top_p_sampler == nullptr) {
+    return absl::InternalError("ScoreCustomSampling requires a TopPSampler.");
+  } else if (top_p_sampler->getBatchSize() != target_texts.size()) {
+    return absl::InvalidArgumentError(
+        "ScoreLoop batch size must match the target text size.");
+  }
+  int num_output_candidates = top_p_sampler->getBatchSize();
+  const int max_num_tokens = TryGetMaxNumTokens(executor);
+  std::optional<BenchmarkInfo> benchmark_info = std::nullopt;
+  DecodeOneStep run_one_step(&executor, &tokenizer,
+                             /*num_output_candidates=*/num_output_candidates,
+                             stop_token_detector, benchmark_info, &sampler);
+  std::vector<std::vector<int>> ids_for_each_target_in_batch;
+  int max_num_tokens_for_each_target_in_batch = 0;
+  for (const auto& target : target_texts) {
+    ASSIGN_OR_RETURN(std::vector<int> ids, tokenizer.TextToTokenIds(target));
+    max_num_tokens_for_each_target_in_batch =
+        std::max(max_num_tokens_for_each_target_in_batch, (int)ids.size());
+    ids_for_each_target_in_batch.push_back(ids);
+  }
+  if (max_num_tokens_for_each_target_in_batch >= max_num_tokens) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Input token ids are too long. "
+        "Exceeding the maximum number of tokens allowed: ",
+        max_num_tokens_for_each_target_in_batch, " >= ", max_num_tokens));
+  }
+  std::vector<float> step_neg_log_likelihood_sum =
+      std::vector<float>(num_output_candidates, 0.0f);
+  // TODO(ritviksharma): This is a temporary solution that only supports one
+  // output candidate. We need to refactor this to support multiple targets
+  // which will require padding the targets with a null token which does not
+  // exist in the vocabulary and thus does not contribute to the perplexity.
+  std::vector<int> decoded_ids_for_each_target_in_batch =
+      std::vector<int>(ids_for_each_target_in_batch.size(), 0);
+  for (int i = 0; i < max_num_tokens_for_each_target_in_batch; ++i) {
+    for (int j = 0; j < ids_for_each_target_in_batch.size(); ++j) {
+      if (i < ids_for_each_target_in_batch[j].size()) {
+        decoded_ids_for_each_target_in_batch[j] =
+            ids_for_each_target_in_batch[j][i];
+      } else {
+        decoded_ids_for_each_target_in_batch[j] = -1;  // Padding token.
+      }
+    }
+    auto step_neg_log_likelihood = run_one_step.computeConfidencesForBatch(
+        decoded_ids_for_each_target_in_batch, &decoded_ids);
+    if (!step_neg_log_likelihood.ok()) {
+      return step_neg_log_likelihood.status();
+    }
+    for (int j = 0; j < num_output_candidates; ++j) {
+      step_neg_log_likelihood_sum[j] += step_neg_log_likelihood.value()[j];
+    }
+  }
+  return step_neg_log_likelihood_sum;
+}
 
 absl::StatusOr<int> Prefill(LlmExecutor& executor, ExecutorInputs& inputs,
                             bool wait_for_completion,

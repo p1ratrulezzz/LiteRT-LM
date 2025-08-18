@@ -35,6 +35,13 @@ class TopPSampler : public Sampler {
                                         TensorBuffer& ids_tensor,
                                         TensorBuffer* scores_tensor) override;
 
+  // Returns the temperature of the sampler.
+  float getTemperature() { return temperature_; }
+
+  // Returns the batch size of the sampler.
+  int getBatchSize() { return batch_size_; }
+
+
  private:
   explicit TopPSampler(int k, float p, float temperature, int batch_size,
                        int seed)

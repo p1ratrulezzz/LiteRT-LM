@@ -346,6 +346,27 @@ TEST_F(PipelineCustomSamplingTest, DecodeCustomSampling) {
   EXPECT_EQ(*(responses->GetScoreAt(1)), 0.0f);
 }
 
+TEST_F(PipelineCustomSamplingTest, ScoreCustomSampling_custom_executor_bs1) {
+  std::vector<std::vector<int>> decode_tokens = {{90},  {547}, {58},   {735},
+                                                 {210}, {466}, {2294}, {0}};
+  auto executor = std::make_unique<FakeLlmExecutor>(
+      /*vocab_size=*/2560,
+      /*prefill_tokens=*/std::vector<std::vector<int>>{}, decode_tokens,
+      /*batch_size=*/1);
+  auto sampler_or = TopPSampler::Create(/*k=*/1, /*p=*/0.5, /*temperature=*/1.0,
+                                        /*batch_size=*/1, /*seed=*/1);
+  EXPECT_TRUE(sampler_or.ok());
+  std::unique_ptr<TopPSampler> sampler = std::move(sampler_or.value());
+  auto decoded_ids = CreateTensorBuffer<int>({1, 1});
+  StopTokenDetector stop_token_detector(1);
+  EXPECT_OK(stop_token_detector.AddStopTokenSequence({0}));
+  auto score = ScoreCustomSampling(
+      *executor, *tokenizer_, stop_token_detector,
+      std::vector<absl::string_view>{"Hello World!"}, *sampler, *decoded_ids);
+  EXPECT_OK(score);
+  EXPECT_EQ((*score)[0], 0.0f);
+}
+
 TEST_F(PipelineCustomSamplingTest, DecodeCustomSamplingReachMaxNumTokens) {
   // Set the max number of tokens to 3.
   executor_->GetMutableExecutorSettings().value()->SetMaxNumTokens(3);
