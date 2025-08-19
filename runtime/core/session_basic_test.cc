@@ -26,6 +26,8 @@
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/synchronization/notification.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
+#include "litert/cc/litert_tensor_buffer.h"  // from @litert
+#include "litert/test/matchers.h"  // from @litert
 #include "runtime/components/sentencepiece_tokenizer.h"
 #include "runtime/components/tokenizer.h"
 #include "runtime/engine/engine_settings.h"
@@ -34,6 +36,7 @@
 #include "runtime/executor/fake_llm_executor.h"
 #include "runtime/executor/llm_executor.h"
 #include "runtime/framework/threadpool.h"
+#include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/test_utils.h"  // NOLINT
 
 namespace litert::lm {
@@ -153,6 +156,7 @@ TEST_F(SessionBasicTest, RunDecodeAsync) {
   const std::vector<std::vector<int>> stop_token_ids = {{2294}};
   SessionConfig session_config = SessionConfig::CreateDefault();
   session_config.GetMutableSamplerParams() = sampler_params_;
+  session_config.SetStartTokenId(2);
   session_config.GetMutableStopTokenIds() = stop_token_ids;
   session_config.SetSamplerBackend(Backend::CPU);
   auto session =
@@ -296,6 +300,165 @@ TEST_F(SessionBasicTest, GenerateContentStreamDecodeError) {
   absl::Status status = observer.WaitUntilDone();
   EXPECT_THAT(status, testing::status::StatusIs(absl::StatusCode::kInternal,
                                                 "Decode failed"));
+}
+
+TEST_F(SessionBasicTest, ApplyPromptTemplates) {
+  const std::vector<std::vector<int>> stop_token_ids = {{2294}};
+  SessionConfig session_config = SessionConfig::CreateDefault();
+  session_config.GetMutableSamplerParams() = sampler_params_;
+  session_config.GetMutableStopTokenIds() = stop_token_ids;
+  session_config.SetStartTokenId(2);
+  session_config.SetSamplerBackend(Backend::CPU);
+  session_config.GetMutablePromptTemplates().mutable_user()->set_prefix(
+      "<test>User\n");
+  session_config.GetMutablePromptTemplates().mutable_user()->set_suffix(
+      "<end>\n");
+  session_config.GetMutablePromptTemplates().mutable_model()->set_prefix(
+      "<test>Model\n");
+  auto session_or =
+      SessionBasic::Create(executor_.get(), tokenizer_.get(),
+                           /*image_preprocessor=*/nullptr,
+                           /*vision_executor=*/nullptr, session_config,
+                           std::nullopt, worker_thread_pool_.get());
+  ASSERT_OK(session_or);
+  auto session = std::move(*session_or);
+  // First chunk of the first turn will have the BOS token.
+  EXPECT_THAT(
+      session->ApplyPromptTemplates("Hello World!", /*is_first_chunk=*/true,
+                                    /*is_last_chunk=*/false),
+      testing::status::IsOkAndHolds("</s><test>User\nHello World!"));
+  // Both prefix and suffix will be added.
+  EXPECT_THAT(
+      session->ApplyPromptTemplates("Hello World!", /*is_first_chunk=*/true,
+                                    /*is_last_chunk=*/true),
+      testing::status::IsOkAndHolds(
+          "\n<test>User\nHello World!<end>\n<test>Model\n"));
+  // Only suffix will be added.
+  EXPECT_THAT(
+      session->ApplyPromptTemplates("Hello World!", /*is_first_chunk=*/false,
+                                    /*is_last_chunk=*/true),
+      testing::status::IsOkAndHolds("Hello World!<end>\n<test>Model\n"));
+}
+
+TEST_F(SessionBasicTest,
+       ProcessContentsAndCreateCombinedExecutorInputSingleText) {
+  const std::vector<std::vector<int>> stop_token_ids = {{2294}};
+  SessionConfig session_config = SessionConfig::CreateDefault();
+  session_config.GetMutableSamplerParams() = sampler_params_;
+  session_config.GetMutableStopTokenIds() = stop_token_ids;
+  session_config.SetStartTokenId(2);
+  session_config.SetSamplerBackend(Backend::CPU);
+  session_config.GetMutablePromptTemplates().mutable_user()->set_prefix("U:");
+  session_config.GetMutablePromptTemplates().mutable_user()->set_suffix(":U\n");
+  session_config.GetMutablePromptTemplates().mutable_model()->set_prefix("M:");
+  auto session_or =
+      SessionBasic::Create(executor_.get(), tokenizer_.get(),
+                           /*image_preprocessor=*/nullptr,
+                           /*vision_executor=*/nullptr, session_config,
+                           std::nullopt, worker_thread_pool_.get());
+  ASSERT_OK(session_or);
+  auto session = std::move(*session_or);
+
+  std::vector<InputData> preprocessed_contents;
+  ASSERT_OK_AND_ASSIGN(auto ids_buffer, tokenizer_->TokenIdsToTensorBuffer(
+                                            {90, 547, 58, 735, 210, 466}));
+  preprocessed_contents.emplace_back(InputText(std::move(ids_buffer)));
+
+  auto executor_input_or =
+      session->ProcessContentsAndCreateCombinedExecutorInput(
+          preprocessed_contents);
+  ASSERT_OK(executor_input_or);
+
+  ASSERT_OK_AND_ASSIGN(auto text_data, executor_input_or->GetTextDataPtr());
+  ASSERT_NE(text_data, nullptr);
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto token_ids_span,
+      ReferTensorBufferAsSpan<int>(text_data->GetTokenIds()));
+  EXPECT_THAT(std::vector<int>(token_ids_span.begin(), token_ids_span.end()),
+              testing::ElementsAre(90, 547, 58, 735, 210, 466));
+}
+
+TEST_F(SessionBasicTest,
+       ProcessContentsAndCreateCombinedExecutorInputMultiText) {
+  const std::vector<std::vector<int>> stop_token_ids = {{2294}};
+  SessionConfig session_config = SessionConfig::CreateDefault();
+  session_config.GetMutableSamplerParams() = sampler_params_;
+  session_config.GetMutableStopTokenIds() = stop_token_ids;
+  session_config.SetStartTokenId(2);
+  session_config.SetSamplerBackend(Backend::CPU);
+  session_config.GetMutablePromptTemplates().mutable_user()->set_prefix("U:");
+  session_config.GetMutablePromptTemplates().mutable_user()->set_suffix(":U\n");
+  session_config.GetMutablePromptTemplates().mutable_model()->set_prefix("M:");
+  auto session_or =
+      SessionBasic::Create(executor_.get(), tokenizer_.get(),
+                           /*image_preprocessor=*/nullptr,
+                           /*vision_executor=*/nullptr, session_config,
+                           std::nullopt, worker_thread_pool_.get());
+  ASSERT_OK(session_or);
+  auto session = std::move(*session_or);
+
+  std::vector<InputData> preprocessed_contents;
+  LITERT_ASSERT_OK_AND_ASSIGN(auto ids_buffer1,
+                              tokenizer_->TokenIdsToTensorBuffer({90, 547}));
+  preprocessed_contents.emplace_back(InputText(std::move(ids_buffer1)));
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto ids_buffer2,
+      tokenizer_->TokenIdsToTensorBuffer({58, 735, 210, 466}));
+  preprocessed_contents.emplace_back(InputText(std::move(ids_buffer2)));
+
+  auto executor_input_or =
+      session->ProcessContentsAndCreateCombinedExecutorInput(
+          preprocessed_contents);
+  ASSERT_OK(executor_input_or);
+
+  ASSERT_OK_AND_ASSIGN(auto text_data, executor_input_or->GetTextDataPtr());
+  ASSERT_NE(text_data, nullptr);
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto token_ids_span,
+      ReferTensorBufferAsSpan<int>(text_data->GetTokenIds()));
+  EXPECT_THAT(std::vector<int>(token_ids_span.begin(), token_ids_span.end()),
+              testing::ElementsAre(90, 547, 58, 735, 210, 466));
+}
+
+TEST_F(SessionBasicTest,
+       ProcessContentsAndCreateCombinedExecutorInputEmptyFails) {
+  SessionConfig session_config = SessionConfig::CreateDefault();
+  session_config.SetSamplerBackend(Backend::CPU);
+  auto session_or =
+      SessionBasic::Create(executor_.get(), tokenizer_.get(),
+                           /*image_preprocessor=*/nullptr,
+                           /*vision_executor=*/nullptr, session_config,
+                           std::nullopt, worker_thread_pool_.get());
+  ASSERT_OK(session_or);
+  auto session = std::move(*session_or);
+
+  std::vector<InputData> preprocessed_contents;
+  auto result = session->ProcessContentsAndCreateCombinedExecutorInput(
+      preprocessed_contents);
+  EXPECT_THAT(result, testing::status::StatusIs(
+                          absl::StatusCode::kInvalidArgument,
+                          "No token IDs found in preprocessed_contents."));
+}
+
+TEST_F(SessionBasicTest,
+       ProcessContentsAndCreateCombinedExecutorInputAudioFails) {
+  SessionConfig session_config = SessionConfig::CreateDefault();
+  session_config.SetSamplerBackend(Backend::CPU);
+  auto session_or =
+      SessionBasic::Create(executor_.get(), tokenizer_.get(),
+                           /*image_preprocessor=*/nullptr,
+                           /*vision_executor=*/nullptr, session_config,
+                           std::nullopt, worker_thread_pool_.get());
+  ASSERT_OK(session_or);
+  auto session = std::move(*session_or);
+
+  std::vector<InputData> preprocessed_contents;
+  preprocessed_contents.emplace_back(InputAudio(""));
+  auto result = session->ProcessContentsAndCreateCombinedExecutorInput(
+      preprocessed_contents);
+  EXPECT_THAT(result, testing::status::StatusIs(
+                          absl::StatusCode::kUnimplemented,
+                          "Audio prefill is not implemented yet."));
 }
 
 }  // namespace

@@ -175,6 +175,7 @@ cc_test(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
+        "@litert//litert/test:matchers",
         "//runtime/components:sentencepiece_tokenizer",
         "//runtime/components:tokenizer",
         "//runtime/engine:engine_settings",
@@ -183,8 +184,16 @@ cc_test(
         "//runtime/executor:fake_llm_executor",
         "//runtime/executor:llm_executor",
         "//runtime/framework:threadpool",
+        "//runtime/util:convert_tensor_buffer",
         "//runtime/util:test_utils",
-    ],
+    ] + select({
+        "@litert//litert:litert_link_capi_so": [
+            "@litert//litert/cc:litert_tensor_buffer",
+        ],
+        "//conditions:default": [
+            "@litert//litert/cc/internal:litert_tensor_buffer",
+        ],
+    }),
 )
 
 cc_library(
