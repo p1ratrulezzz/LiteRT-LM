@@ -153,6 +153,7 @@ TEST_F(SessionBasicTest, RunDecodeAsync) {
   const std::vector<std::vector<int>> stop_token_ids = {{2294}};
   SessionConfig session_config = SessionConfig::CreateDefault();
   session_config.GetMutableSamplerParams() = sampler_params_;
+  session_config.SetStartTokenId(2);
   session_config.GetMutableStopTokenIds() = stop_token_ids;
   session_config.SetSamplerBackend(Backend::CPU);
   auto session =
@@ -296,6 +297,44 @@ TEST_F(SessionBasicTest, GenerateContentStreamDecodeError) {
   absl::Status status = observer.WaitUntilDone();
   EXPECT_THAT(status, testing::status::StatusIs(absl::StatusCode::kInternal,
                                                 "Decode failed"));
+}
+
+TEST_F(SessionBasicTest, ApplyPromptTemplates) {
+  const std::vector<std::vector<int>> stop_token_ids = {{2294}};
+  SessionConfig session_config = SessionConfig::CreateDefault();
+  session_config.GetMutableSamplerParams() = sampler_params_;
+  session_config.GetMutableStopTokenIds() = stop_token_ids;
+  session_config.SetStartTokenId(2);
+  session_config.SetSamplerBackend(Backend::CPU);
+  session_config.GetMutablePromptTemplates().mutable_user()->set_prefix(
+      "<test>User\n");
+  session_config.GetMutablePromptTemplates().mutable_user()->set_suffix(
+      "<end>\n");
+  session_config.GetMutablePromptTemplates().mutable_model()->set_prefix(
+      "<test>Model\n");
+  auto session_or =
+      SessionBasic::Create(executor_.get(), tokenizer_.get(),
+                           /*image_preprocessor=*/nullptr,
+                           /*vision_executor=*/nullptr, session_config,
+                           std::nullopt, worker_thread_pool_.get());
+  ASSERT_OK(session_or);
+  auto session = std::move(*session_or);
+  // First chunk of the first turn will have the BOS token.
+  EXPECT_THAT(
+      session->ApplyPromptTemplates("Hello World!", /*is_first_chunk=*/true,
+                                    /*is_last_chunk=*/false),
+      testing::status::IsOkAndHolds("</s><test>User\nHello World!"));
+  // Both prefix and suffix will be added.
+  EXPECT_THAT(
+      session->ApplyPromptTemplates("Hello World!", /*is_first_chunk=*/true,
+                                    /*is_last_chunk=*/true),
+      testing::status::IsOkAndHolds(
+          "\n<test>User\nHello World!<end>\n<test>Model\n"));
+  // Only suffix will be added.
+  EXPECT_THAT(
+      session->ApplyPromptTemplates("Hello World!", /*is_first_chunk=*/false,
+                                    /*is_last_chunk=*/true),
+      testing::status::IsOkAndHolds("Hello World!<end>\n<test>Model\n"));
 }
 
 }  // namespace
