@@ -52,75 +52,11 @@ class LitertlmCoreTest(parameterized.TestCase):
   def test_any_section_data_type_to_string_unknown(self):
     """Tests the conversion of an unknown AnySectionDataType enum value.
 
-    This test ensures that an appropriate message is returned when an
+    This test ensures that an appropriate error is raised when an
     unrecognized enum value is provided.
     """
-    self.assertEqual(
-        litertlm_core.any_section_data_type_to_string(999),
-        "Unknown AnySectionDataType value (999)",
-    )
-
-  @parameterized.parameters(
-      ("test.txt", ".txt"),
-      ("model.tflite", ".tflite"),
-      ("noextension", ""),
-      ("archive.tar.gz", ".gz"),
-      (".hidden", ""),
-  )
-  def test_get_file_extension(self, filename, expected_ext):
-    """Tests the extraction of file extensions from filenames.
-
-    Args:
-      filename: The input filename.
-      expected_ext: The expected file extension.
-    """
-    self.assertEqual(litertlm_core.get_file_extension(filename), expected_ext)
-
-  @parameterized.parameters(
-      ("model.tflite", schema.AnySectionDataType.TFLiteModel, "tflite"),
-      ("meta.pb", schema.AnySectionDataType.LlmMetadataProto, "llm_metadata"),
-      (
-          "meta.proto",
-          schema.AnySectionDataType.LlmMetadataProto,
-          "llm_metadata",
-      ),
-      (
-          "meta.pbtext",
-          schema.AnySectionDataType.LlmMetadataProto,
-          "llm_metadata",
-      ),
-      (
-          "meta.prototext",
-          schema.AnySectionDataType.LlmMetadataProto,
-          "llm_metadata",
-      ),
-      ("tokenizer.spiece", schema.AnySectionDataType.SP_Tokenizer, "tokenizer"),
-      (
-          "tokenizer.json",
-          schema.AnySectionDataType.HF_Tokenizer_Zlib,
-          "hf_tokenizer_zlib",
-      ),
-      (
-          "other.json",
-          schema.AnySectionDataType.GenericBinaryData,
-          "binary_data",
-      ),
-      ("data.bin", schema.AnySectionDataType.GenericBinaryData, "binary_data"),
-      ("unknown", schema.AnySectionDataType.GenericBinaryData, "binary_data"),
-  )
-  def test_get_section_type_and_name(
-      self, filename, expected_type, expected_name
-  ):
-    """Tests the determination of section types and names based on filenames.
-
-    Args:
-      filename: The input filename.
-      expected_type: The expected AnySectionDataType enum value.
-      expected_name: The expected section name.
-    """
-    stype, sname = litertlm_core.get_section_type_and_name(filename)
-    self.assertEqual(stype, expected_type)
-    self.assertEqual(sname, expected_name)
+    with self.assertRaises(ValueError):
+      litertlm_core.any_section_data_type_to_string(999)
 
 
 if __name__ == "__main__":

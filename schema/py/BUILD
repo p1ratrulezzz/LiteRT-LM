@@ -32,28 +32,14 @@ pytype_strict_library(
     ],
 )
 
-pytype_strict_library(
-    name = "litertlm_writer",
-    srcs = ["litertlm_writer.py"],
+py_test(
+    name = "litertlm_core_test",
+    srcs = ["litertlm_core_test.py"],
     deps = [
         ":litertlm_core",
-        "@flatbuffers//:runtime_py",  # buildcleaner: keep
-        "//runtime/proto:llm_metadata_py_pb2",
         "//schema/core:litertlm_header_schema_py",
-        "@com_google_protobuf//:protobuf_python",
-    ],
-)
-
-pytype_strict_binary(
-    name = "litertlm_writer_main",
-    srcs = ["litertlm_writer_main.py"],
-    tags = [
-        "manual",
-        "notap",
-    ],
-    deps = [
-        ":litertlm_writer",
-        "@absl_py//absl:app",
+        "@absl_py//absl/testing:absltest",
+        "@absl_py//absl/testing:parameterized",
     ],
 )
 
@@ -86,27 +72,6 @@ py_test(
     deps = [
         ":litertlm_peek",
         "@absl_py//absl/testing:absltest",
-    ],
-)
-
-py_test(
-    name = "litertlm_writer_test",
-    srcs = ["litertlm_writer_test.py"],
-    deps = [
-        ":litertlm_peek",
-        ":litertlm_writer",
-        "@absl_py//absl/testing:absltest",
-    ],
-)
-
-py_test(
-    name = "litertlm_core_test",
-    srcs = ["litertlm_core_test.py"],
-    deps = [
-        ":litertlm_core",
-        "//schema/core:litertlm_header_schema_py",
-        "@absl_py//absl/testing:absltest",
-        "@absl_py//absl/testing:parameterized",
     ],
 )
 
