@@ -500,6 +500,41 @@ cc_library(
 )
 
 cc_library(
+    name = "model_resources_tflite",
+    srcs = ["model_resources_tflite.cc"],
+    hdrs = [
+        "model_resources_tflite.h",
+    ],
+    deps = [
+        ":model_resources",
+        ":tokenizer",
+        "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+        "@litert//litert/cc:litert_buffer_ref",
+        "@litert//litert/cc:litert_expected",
+        "@litert//litert/cc:litert_macros",
+        "//runtime/proto:llm_metadata_cc_proto",
+        "//runtime/util:litert_status_util",
+        "//runtime/util:memory_mapped_file",
+        "//runtime/util:metadata_util",
+        "//runtime/util:scoped_file",
+    ] + select({
+        ":disable_sentencepiece_tokenizer": [],
+        "//conditions:default": [":sentencepiece_tokenizer"],
+    }) + select({
+        "@litert//litert:litert_link_capi_so": [
+            "@litert//litert/cc:litert_model",
+        ],
+        "//conditions:default": [
+            "@litert//litert/cc/internal:litert_model",
+        ],
+    }),
+)
+
+cc_library(
     name = "prompt_template",
     srcs = ["prompt_template.cc"],
     hdrs = ["prompt_template.h"],

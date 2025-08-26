@@ -36,6 +36,7 @@
 #include "runtime/components/model_resources.h"
 #include "runtime/components/model_resources_litert_lm.h"
 #include "runtime/components/model_resources_task.h"
+#include "runtime/components/model_resources_tflite.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/util/file_format_util.h"
 #include "runtime/util/litert_lm_loader.h"
@@ -401,7 +402,7 @@ BuildLiteRtCompiledModelResources(const ModelAssets& model_assets) {
 
   switch (format) {
     case FileFormat::TFLITE:
-      return absl::InvalidArgumentError("Unsupported file format.");
+      return ModelResourcesTflite::Create(std::move(scoped_file));
     case FileFormat::TASK:
       return BuildModelResourcesFromTaskFormat(std::move(scoped_file));
     case FileFormat::LITERT_LM:

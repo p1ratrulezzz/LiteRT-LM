@@ -65,6 +65,7 @@ cc_library(
         "//runtime/components:model_resources",
         "//runtime/components:model_resources_litert_lm",
         "//runtime/components:model_resources_task",
+        "//runtime/components:model_resources_tflite",
         "//runtime/components:sentencepiece_tokenizer",
         "//runtime/util:external_file_cc_proto",
         "//runtime/util:file_format_util",
