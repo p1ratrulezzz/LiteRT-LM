@@ -33,11 +33,11 @@
 #include "runtime/engine/io_types.h"
 #include "runtime/util/litert_status_util.h"
 #include "runtime/util/status_macros.h"  // IWYU pragma: keep
-#include "third_party/stblib/stb_image.h"
+#include "stb_image.h"  // from @stb
 // The stb_image_resize library requires this macro to be defined in one C++
 // file to include the function implementations.
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
-#include "third_party/stblib/stb_image_resize.h"
+#include "stb_image_resize.h"  // from @stb
 
 namespace litert::lm {
 

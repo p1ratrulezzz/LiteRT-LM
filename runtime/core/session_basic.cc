@@ -25,6 +25,7 @@
 #include "absl/memory/memory.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
+#include "absl/strings/match.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
@@ -49,6 +50,12 @@
 #include "runtime/util/status_macros.h"  // IWYU pragma: keep
 
 namespace litert::lm {
+namespace {
+
+constexpr int kStartOfImageTokenId = 255999;
+constexpr int kNumSpecialTokens = 257;
+
+}  // namespace
 
 // static
 absl::StatusOr<std::unique_ptr<SessionBasic>> SessionBasic::Create(
@@ -95,11 +102,104 @@ SessionBasic::~SessionBasic() {
 }
 
 absl::StatusOr<std::string> SessionBasic::ApplyPromptTemplates(
-    absl::string_view input) {
-  return absl::StrCat(session_config_.GetPromptTemplates().user().prefix(),
-                      input,
-                      session_config_.GetPromptTemplates().user().suffix(),
-                      session_config_.GetPromptTemplates().model().prefix());
+    absl::string_view input, bool is_first_chunk, bool is_last_chunk) {
+  auto bos_token_id = session_config_.GetStartTokenId();
+  std::string bos_string = "";
+  // Lookup the BOS string from the tokenizer.
+  // If the BOS token id is not valid, the bos string will remain empty.
+  if (bos_token_id >= 0) {
+    ASSIGN_OR_RETURN(bos_string, tokenizer_.TokenIdsToText({bos_token_id}));
+  }
+
+  // Check if the input contains the BOS string. If it does, return an error.
+  // This is to prevent the user from including the BOS string in the input.
+  // If the BOS string is empty, it means the BOS token id is not valid. In this
+  // case, we will not check for the BOS string in the input.
+  if (!bos_string.empty() && absl::StrContains(input, bos_string)) {
+    return absl::InvalidArgumentError(
+        "Input contains bos control token. Control token should not be "
+        "included in the input.");
+  }
+
+  std::string turn_prefix = "";
+  if (is_first_chunk) {
+    std::string session_prefix;
+    if (is_first_turn_) {
+      is_first_turn_ = false;
+      // If no legal bos token, the bos string will be empty here which is fine.
+      session_prefix = bos_string;
+    } else {
+      session_prefix = "\n";
+    }
+    turn_prefix = absl::StrCat(
+        session_prefix, session_config_.GetPromptTemplates().user().prefix());
+  }
+
+  std::string turn_suffix = "";
+  if (is_last_chunk) {
+    turn_suffix =
+        absl::StrCat(session_config_.GetPromptTemplates().user().suffix(),
+                     session_config_.GetPromptTemplates().model().prefix());
+  }
+
+  return absl::StrCat(turn_prefix, input, turn_suffix);
+}
+
+absl::StatusOr<ExecutorInputs>
+SessionBasic::ProcessContentsAndCreateCombinedExecutorInput(
+    const std::vector<InputData>& preprocessed_contents) {
+  std::vector<int> combined_token_ids;
+  std::optional<ExecutorVisionData> single_image_data = std::nullopt;
+  for (const auto& preprocessed_content : preprocessed_contents) {
+    if (const auto* input_text =
+            std::get_if<InputText>(&preprocessed_content)) {
+      ASSIGN_OR_RETURN(const auto* token_ids,
+                       input_text->GetPreprocessedTextTensor());
+      if (token_ids == nullptr) {
+        return absl::InvalidArgumentError(
+            "Token IDs is null in preprocessed_contents.");
+      }
+      LITERT_ASSIGN_OR_RETURN_ABSL(auto ids_buffer_span,
+                                   ReferTensorBufferAsSpan<int>(*token_ids));
+      combined_token_ids.insert(combined_token_ids.end(),
+                                ids_buffer_span.begin(), ids_buffer_span.end());
+    } else if (const auto* input_image =
+                   std::get_if<InputImage>(&preprocessed_content)) {
+      if (single_image_data.has_value()) {
+        return absl::InvalidArgumentError(
+            "Only one image is supported per prefill call.");
+      }
+      ASSIGN_OR_RETURN(const auto* image_tensor,
+                       input_image->GetPreprocessedImageTensor());
+      if (image_tensor == nullptr) {
+        return absl::InvalidArgumentError(
+            "Image tensor is null in preprocessed_contents.");
+      }
+      ASSIGN_OR_RETURN(single_image_data,
+                       vision_executor_->Encode(*image_tensor));
+      // Hardcoded token id for start of image token.
+      combined_token_ids.push_back(kStartOfImageTokenId);
+      for (int i = 0; i < kNumSpecialTokens; ++i) {
+        combined_token_ids.push_back(ExecutorVisionData::kSpecialToken);
+      }
+    } else if (const auto* input_audio =
+                   std::get_if<InputAudio>(&preprocessed_content)) {
+      return absl::UnimplementedError("Audio prefill is not implemented yet.");
+    }
+  }
+
+  if (combined_token_ids.empty()) {
+    return absl::InvalidArgumentError(
+        "No token IDs found in preprocessed_contents.");
+  }
+
+  ASSIGN_OR_RETURN(auto token_ids_buffer,
+                   tokenizer_.TokenIdsToTensorBuffer(combined_token_ids));
+
+  ExecutorInputs inputs(ExecutorTextData(std::move(token_ids_buffer)),
+                        std::move(single_image_data), std::nullopt);
+
+  return inputs;
 }
 
 // TODO - b/436674053: Modulize the preprocessing logic into a separate
@@ -107,7 +207,8 @@ absl::StatusOr<std::string> SessionBasic::ApplyPromptTemplates(
 absl::StatusOr<std::vector<InputData>> SessionBasic::PreprocessContents(
     const std::vector<InputData>& contents) {
   std::vector<InputData> preprocessed_contents;
-  for (const auto& input : contents) {
+  for (int i = 0; i < contents.size(); ++i) {
+    const auto& input = contents[i];
     if (const auto* input_text = std::get_if<InputText>(&input)) {
       if (input_text->IsTensorBuffer()) {
         ASSIGN_OR_RETURN(const auto* token_ids,
@@ -118,7 +219,24 @@ absl::StatusOr<std::vector<InputData>> SessionBasic::PreprocessContents(
             InputText(std::move(token_ids_clone)));
       } else {
         ASSIGN_OR_RETURN(auto raw_text, input_text->GetRawTextString());
-        ASSIGN_OR_RETURN(auto formatted_text, ApplyPromptTemplates(raw_text));
+        ASSIGN_OR_RETURN(
+            auto formatted_text,
+            ApplyPromptTemplates(raw_text,
+                                 /*is_first_chunk=*/i == 0,
+                                 /*is_last_chunk=*/i == contents.size() - 1));
+        auto bos_token_id = session_config_.GetStartTokenId();
+        std::string bos_string = "";
+        if (bos_token_id >= 0) {
+          ASSIGN_OR_RETURN(bos_string,
+                           tokenizer_.TokenIdsToText({bos_token_id}));
+        }
+        bool bos_token_found = false;
+        if (!bos_string.empty() &&
+            absl::StartsWith(formatted_text, bos_string)) {
+          formatted_text = formatted_text.substr(bos_string.size());
+          bos_token_found = true;
+        }
+
         int benchmark_prefill_token_count = 0;
         if (benchmark_info_.has_value()) {
           benchmark_prefill_token_count =
@@ -131,7 +249,7 @@ absl::StatusOr<std::vector<InputData>> SessionBasic::PreprocessContents(
           // If benchmark is enabled, we will use the benchmark prefill token
           // count to set the prefill token count.
           ids.resize(benchmark_prefill_token_count);
-        } else {
+        } else if (bos_token_found) {
           ids.insert(ids.begin(), session_config_.GetStartTokenId());
         }
         ASSIGN_OR_RETURN(auto ids_buffer,
@@ -166,20 +284,10 @@ absl::StatusOr<std::vector<InputData>> SessionBasic::PreprocessContents(
 absl::Status SessionBasic::PrefillInternal(
     const std::vector<InputData>& preprocessed_contents,
     bool wait_for_completion) {
-  // TODO(b/397975034): Consider to utilize a prompt formatting logic in a
-  // separate library/class.
-  // Update the input with prompt formatting.
-  RET_CHECK(preprocessed_contents.size() == 1)
-      << "preprocessed_contents must have exactly one element.";
-  RET_CHECK(std::holds_alternative<InputText>(preprocessed_contents.at(0)))
-      << "preprocessed_contents must have an InputText.";
-  const InputText& input_text =
-      std::get<InputText>(preprocessed_contents.at(0));
-  ASSIGN_OR_RETURN(const auto* token_ids,
-                   input_text.GetPreprocessedTextTensor());
-  LITERT_ASSIGN_OR_RETURN_ABSL(auto token_ids_clone, token_ids->Duplicate());
-  ExecutorInputs inputs(ExecutorTextData(std::move(token_ids_clone)),
-                        std::nullopt, std::nullopt);
+  ASSIGN_OR_RETURN(
+      ExecutorInputs inputs,
+      ProcessContentsAndCreateCombinedExecutorInput(preprocessed_contents));
+
   // This should be added to the beginning of the next prefill call as will no?
   // Also, this is not thread safe. More discussion with @ztenghui is needed.
   ASSIGN_OR_RETURN(

@@ -325,6 +325,14 @@ http_archive(
     urls = ["https://github.com/mackron/miniaudio/archive/refs/tags/0.11.22.tar.gz"],
 )
 
+http_archive(
+    name = "stb",
+    build_file = "@//:BUILD.stb",
+    sha256 = "119b9f3cca3e50225dc946ed1acd1b7a160943bc8bf549760109cea4e4e7c836",
+    strip_prefix = "stb-f58f558c120e9b32c217290b80bad1a0729fbb2c",
+    urls = ["https://github.com/nothings/stb/archive/f58f558c120e9b32c217290b80bad1a0729fbb2c.zip"],
+)
+
 # Android rules. Need latest rules_android_ndk to use NDK 26+.
 load("@rules_android_ndk//:rules.bzl", "android_ndk_repository")
 

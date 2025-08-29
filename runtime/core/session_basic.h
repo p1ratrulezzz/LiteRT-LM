@@ -33,6 +33,7 @@
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/executor/llm_executor.h"
+#include "runtime/executor/llm_executor_io_types.h"
 #include "runtime/executor/vision_executor.h"
 #include "runtime/framework/threadpool.h"
 #include "runtime/proto/sampler_params.pb.h"
@@ -77,6 +78,23 @@ class SessionBasic : public Engine::Session {
 
   absl::StatusOr<BenchmarkInfo> GetBenchmarkInfo() override;
 
+  // Util function for applying the prompt templates.
+  // input: The input text to apply the prompt templates.
+  // is_first_chunk: Whether the input is the first chunk of the turn.
+  // is_last_chunk: Whether the input is the last chunk of the turn.
+  // The output is the text input after applying the proper prompt templates.
+  // TODO - b/436674053: This is a temporary solution to add required templates
+  // to the input. Should be removed once the prompt templates are properly
+  // handled via the conversation layer.
+  absl::StatusOr<std::string> ApplyPromptTemplates(absl::string_view input,
+                                                   bool is_first_chunk,
+                                                   bool is_last_chunk);
+
+  // Util function for creating the combined ExecutorInputs from the
+  // preprocessed contents.
+  absl::StatusOr<ExecutorInputs> ProcessContentsAndCreateCombinedExecutorInput(
+      const std::vector<InputData>& preprocessed_contents);
+
  private:
   explicit SessionBasic(LlmExecutor* absl_nonnull executor,
                         Tokenizer* absl_nonnull tokenizer,
@@ -96,11 +114,6 @@ class SessionBasic : public Engine::Session {
         benchmark_info_(benchmark_info),
         worker_thread_pool_(*worker_thread_pool),
         stop_token_detector_(stop_token_detector) {}
-
-  // Util function for applying the prompt templates.
-  // The input is the raw text input from the user.
-  // The output is the text input after applying the proper prompt templates.
-  absl::StatusOr<std::string> ApplyPromptTemplates(absl::string_view input);
 
   // Preprocesses the input contents. This function is used for pre-processing
   // the input contents before sending them to the LLM executor.
@@ -150,6 +163,12 @@ class SessionBasic : public Engine::Session {
 
   // The stop token detector used for the session.
   StopTokenDetector stop_token_detector_;
+
+  // Whether the current turn is the first turn.
+  // TODO - b/436674053: This is a temporary solution to determine whether the
+  // current turn is the first turn. Should be removed once prompt templates
+  // is no longer used.
+  bool is_first_turn_ = true;
 };
 
 }  // namespace litert::lm

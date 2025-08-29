@@ -295,3 +295,56 @@ cc_test(
         "//runtime/util:test_utils",
     ],
 )
+
+cc_library(
+    name = "stb_image_preprocessor",
+    srcs = ["stb_image_preprocessor.cc"],
+    hdrs = ["stb_image_preprocessor.h"],
+    deps = [
+        ":image_preprocessor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@litert//litert/c:litert_tensor_buffer_types",
+        "@litert//litert/cc:litert_layout",
+        "@litert//litert/cc:litert_macros",
+        "@litert//litert/cc:litert_model",
+        "//runtime/engine:io_types",
+        "//runtime/util:convert_tensor_buffer",
+        "//runtime/util:litert_status_util",
+        "@stb//:stb_image",
+        "@stb//:stb_image_hdrs",
+    ] + select({
+        "@litert//litert:litert_link_capi_so": [
+            "@litert//litert/cc:litert_tensor_buffer",
+        ],
+        "//conditions:default": [
+            "@litert//litert/cc/internal:litert_tensor_buffer",
+        ],
+    }),
+)
+
+cc_test(
+    name = "stb_image_preprocessor_test",
+    srcs = ["stb_image_preprocessor_test.cc"],
+    data = ["//runtime/components/preprocessor/testdata"],
+    deps = [
+        ":image_preprocessor",
+        ":stb_image_preprocessor",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings:string_view",
+        "@litert//litert/c:litert_tensor_buffer_types",
+        "@litert//litert/cc:litert_layout",
+        "//runtime/engine:io_types",
+        "//runtime/util:convert_tensor_buffer",
+        "//runtime/util:test_utils",
+    ] + select({
+        "@litert//litert:litert_link_capi_so": [
+            "@litert//litert/cc:litert_tensor_buffer",
+        ],
+        "//conditions:default": [
+            "@litert//litert/cc/internal:litert_tensor_buffer",
+        ],
+    }),
+)
