@@ -62,8 +62,6 @@ build --define framework_shared_object=true
 build --define tsl_protobuf_header_only=true
 
 build --define=allow_oversize_protos=true
-# protobuf will stop supporting MSVC.
-build:windows --define=protobuf_allow_msvc=true
 
 build --spawn_strategy=standalone
 build -c opt
@@ -111,10 +109,6 @@ build --experimental_link_static_libraries_once=false
 build --incompatible_enforce_config_setting_visibility
 # TODO: also enable this flag after fixing the visibility violations
 # build --incompatible_config_setting_private_default_visibility
-
-# Disable Hermetic CC toolchains
-build --@rules_ml_toolchain//common:enable_hermetic_cc=False
-build --repo_env USE_HERMETIC_CC_TOOLCHAIN=0
 
 # Default options should come above this line.
 
@@ -325,7 +319,9 @@ build:windows --cxxopt=/std:c++20
 build:windows --host_cxxopt=/std:c++20
 
 # TensorFlow configuration for Windows build
-build:windows --repo_env=HERMETIC_PYTHON_VERSION=3.13
+build:windows --repo_env=HERMETIC_PYTHON_VERSION=3.11
+build:windows --action_env=PYTHON_BIN_PATH="C:/Program Files/Python311/python.exe"
+build:windows --python_path="C:/Program Files/Python311/python.exe"
 
 # On Windows, set /std:c11 and /experimental:c11atomics for pthreadpool.
 build:windows --conlyopt=/std:c11
@@ -365,9 +361,6 @@ build:windows --strategy=Genrule=local
 build:windows --genrule_strategy=local
 build:windows --spawn_strategy=local
 
-# protobuf can't find its headers on windows when built locally with bazelisk.
-build:windows --host_copt=/Iexternal/com_google_protobuf/src
-
 # Use Git Bash for genrules
 build:windows --shell_executable="C:/Program Files/Git/bin/bash.exe"
 
@@ -393,9 +386,11 @@ build:avx_linux --copt=-mavx
 build:avx_linux --host_copt=-mavx
 build:avx_win --copt=/arch:AVX
 
-# Assume AVX2 x86_64 platforms for linux and windows.
+# Assume AVX2 x86_64 platforms for linux.
 build:linux --copt=-mavx2
-build:windows --copt=/arch:AVX2
+# Assume AVX x86_64 platforms for windows. AVX2 causes compilation errors on
+# github windows runners.
+build:windows --copt=/arch:AVX
 
 # Enable all targets in XLA
 build:cpu_cross --define=with_cross_compiler_support=true
@@ -520,3 +515,8 @@ test:bulk_test_cpu --build_tests_only
 
 # TODO: b/397625618 Enable bzlmod
 common --noenable_bzlmod
+
+# Fix for older Clang versions that don't support -mavxvnniint8
+build --define=xnn_enable_avxvnniint8=false
+build --define=xnn_enable_avx512fp16=false
+build --define=xnn_enable_avxvnniint16=false
