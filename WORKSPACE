@@ -307,6 +307,14 @@ http_archive(
     sha256 = "34660b5e9a407195d55e8da705ed26cc6d175ce5a6b1fb957e701fb4d5b04022",
     strip_prefix = "json-3.12.0",
     urls = ["https://github.com/nlohmann/json/archive/refs/tags/v3.12.0.zip"],
+    build_file_content = """
+cc_library(
+    name = "json",
+    hdrs = ["single_include/nlohmann/json.hpp"],
+    includes = ["single_include"],
+    visibility = ["//visibility:public"],
+)
+""",
 )
 
 http_archive(

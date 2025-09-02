@@ -35,6 +35,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <thread>
 #include <nlohmann/json.hpp>
 
 
@@ -49,18 +50,20 @@ namespace {
     using ::litert::lm::SessionConfig;
     using json = nlohmann::json;
 
-    const absl::Duration kWaitUntilDoneTimeout = absl::Minutes(5);
+    const absl::Duration kWaitUntilDoneTimeout = absl::Minutes(1);
 
     // Custom observer for streaming output
     class StreamingObserver : public litert::lm::InferenceObservable {
      public:
       StreamingObserver(int sock) : sock_(sock), tokens_sent_(0), total_bytes_sent_(0),
-                                   repetition_count_(0), max_repetitions_(3) {
+                                     repetition_count_(0), max_repetitions_(3), stop_sending_(false) {
         recent_chars_.reserve(100);
       }
 
       // Override OnNext to write tokens incrementally
       void OnNext(const litert::lm::Responses& responses) override {
+        if (stop_sending_) return;  // Skip sending tokens after repetition limit
+
         // Get clean text without metadata
         auto text_or = responses.GetResponseTextAt(0);
         if (text_or.ok()) {
@@ -71,11 +74,11 @@ namespace {
             ABSL_LOG(WARNING) << "Repeating pattern detected (" << repetition_count_ << "/" << max_repetitions_ << "): " << response_chunk;
 
             if (repetition_count_ >= max_repetitions_) {
-              ABSL_LOG(ERROR) << "Too many repeating patterns detected, stopping generation";
+              ABSL_LOG(ERROR) << "Too many repeating patterns detected, stopping token sending";
               const char* stop_msg = " [Generation stopped due to repetition]";
               send(sock_, stop_msg, strlen(stop_msg), 0);
-              // Force stop by not processing more tokens
-              return;
+              stop_sending_ = true;
+              return;  // Stop sending tokens
             }
           } else {
             repetition_count_ = 0;  // Reset counter on new content
@@ -92,6 +95,7 @@ namespace {
             ABSL_LOG(INFO) << "Sent " << sent << " bytes to client (total: " << total_bytes_sent_ << " bytes)";
           } else {
             ABSL_LOG(ERROR) << "Failed to send token to client: " << strerror(errno);
+            stop_sending_ = true;
           }
         } else {
           ABSL_LOG(ERROR) << "Failed to get response text: " << text_or.status();
@@ -109,6 +113,7 @@ namespace {
         } else {
           ABSL_LOG(ERROR) << "Failed to send EOF marker: " << strerror(errno);
         }
+        close(sock_);
       }
 
       // Override OnError for error handling
@@ -170,6 +175,7 @@ namespace {
      std::string recent_chars_;
      int repetition_count_;
      const int max_repetitions_;
+     bool stop_sending_;
     };
 
     absl::Status RunInference(Engine* llm, std::unique_ptr<Engine::Session> session,
@@ -191,8 +197,7 @@ namespace {
         return absl::OkStatus();
       }
 
-      // Ensure client socket is closed after inference
-      close(client_sock);
+      // Client socket is closed in StreamingObserver::OnCompleted or OnError
 
       return absl::OkStatus();
     }
@@ -349,11 +354,11 @@ namespace {
       std::unique_ptr<Engine::Session> session = std::move(*session_or);
       ABSL_LOG(INFO) << "Session created successfully";
 
-      // Run inference
-      RETURN_IF_ERROR(RunInference(llm->get(), std::move(session), formatted_inputs, client_sock));
+      // Run inference in separate thread to handle new connections immediately
+      std::thread inference_thread(RunInference, llm->get(), std::move(session), formatted_inputs, client_sock);
+      inference_thread.detach();
 
-      // Client socket is closed in StreamingObserver::OnCompleted or OnError
-      // Continue to next client
+      // Continue to next client immediately, without waiting for inference to complete
       }
     }
 

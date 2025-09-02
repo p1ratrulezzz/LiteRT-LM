@@ -156,6 +156,7 @@ cc_test(
 cc_binary(
     name = "simple_agent",
     srcs = ["simple_agent.cc"],
+    linkopts = ["-lpthread"],
     deps = [
         ":engine_interface",
         ":engine_settings",
