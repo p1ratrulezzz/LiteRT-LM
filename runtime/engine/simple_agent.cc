@@ -55,8 +55,8 @@ namespace {
     // Custom observer for streaming output
     class StreamingObserver : public litert::lm::InferenceObservable {
      public:
-      StreamingObserver(int sock) : sock_(sock), tokens_sent_(0), total_bytes_sent_(0),
-                                     repetition_count_(0), max_repetitions_(3), stop_sending_(false), closed_(false) {
+      StreamingObserver(int sock, std::atomic<bool>& cancelled) : sock_(sock), cancelled_(&cancelled), tokens_sent_(0), total_bytes_sent_(0),
+                                                                  repetition_count_(0), max_repetitions_(3), stop_sending_(false), closed_(false) {
         recent_chars_.reserve(100);
       }
 
@@ -76,7 +76,7 @@ namespace {
             ABSL_LOG(WARNING) << "Repeating pattern detected (" << repetition_count_ << "/" << max_repetitions_ << "): " << response_chunk;
 
             if (repetition_count_ >= max_repetitions_) {
-              ABSL_LOG(ERROR) << "Too many repeating patterns detected, stopping token sending";
+              ABSL_LOG(ERROR) << "Too many repeating patterns detected, cancelling inference remotely";
               const char* stop_msg = " [Generation stopped due to repetition]";
               send(sock_, stop_msg, strlen(stop_msg), 0);
               // Send EOF marker immediately to signal client completion
@@ -89,8 +89,8 @@ namespace {
               }
               closed_ = true;
               close(sock_);
-              stop_sending_ = true;
-              return;  // Stop sending tokens, let inference finish
+              *cancelled_ = true;
+              return;  // Stop sending tokens
             }
           } else {
             repetition_count_ = 0;  // Reset counter on new content
@@ -187,31 +187,41 @@ namespace {
      }
 
      private:
-       int sock_;
-       int tokens_sent_;
-       size_t total_bytes_sent_;
-       std::string recent_chars_;
-       int repetition_count_;
-       const int max_repetitions_;
-       bool stop_sending_;
-       bool closed_;
+      int sock_;
+      std::atomic<bool>* cancelled_;
+      int tokens_sent_;
+      size_t total_bytes_sent_;
+      std::string recent_chars_;
+      int repetition_count_;
+      const int max_repetitions_;
+      bool stop_sending_;
+      bool closed_;
 
      };
 
     void RunInference(Engine* llm, std::unique_ptr<Engine::Session> session,
                       const std::vector<std::string>& formatted_inputs, int client_sock) {
+      std::atomic<bool> cancelled = false;
+
       std::vector<InputData> inputs;
       for (const auto& formatted_input : formatted_inputs) {
         inputs.emplace_back(InputText(formatted_input));
       }
 
       // Use streaming for incremental output
-      StreamingObserver observer(client_sock);
+      StreamingObserver observer(client_sock, cancelled);
 
       absl::Status status = session->GenerateContentStream(inputs, &observer);
       if (!status.ok()) {
         ABSL_LOG(ERROR) << "Failed to start content stream: " << status;
         close(client_sock);
+        return;
+      }
+
+      // Check if cancelled remotely before waiting
+      if (cancelled) {
+        ABSL_LOG(INFO) << "Inference cancelled remotely, killing thread early";
+        // Client socket is closed in StreamingObserver
         return;
       }
 
