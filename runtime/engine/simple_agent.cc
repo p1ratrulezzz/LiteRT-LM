@@ -50,7 +50,7 @@ namespace {
     using ::litert::lm::SessionConfig;
     using json = nlohmann::json;
 
-    const absl::Duration kWaitUntilDoneTimeout = absl::Minutes(1);
+    const absl::Duration kWaitUntilDoneTimeout = absl::Minutes(5);
 
     // Custom observer for streaming output
     class StreamingObserver : public litert::lm::InferenceObservable {
@@ -71,30 +71,30 @@ namespace {
         if (text_or.ok()) {
           // Check for repetition in character patterns to prevent infinite loops
           std::string response_chunk = std::string(*text_or);
-          if (has_repeating_pattern(response_chunk)) {
-            repetition_count_++;
-            ABSL_LOG(WARNING) << "Repeating pattern detected (" << repetition_count_ << "/" << max_repetitions_ << "): " << response_chunk;
-
-            if (repetition_count_ >= max_repetitions_) {
-              ABSL_LOG(ERROR) << "Too many repeating patterns detected, cancelling inference remotely";
-              const char* stop_msg = " [Generation stopped due to repetition]";
-              send(sock_, stop_msg, strlen(stop_msg), 0);
-              // Send EOF marker immediately to signal client completion
-              const char* eof_marker = "\n<END_OF_RESPONSE>\n";
-              ssize_t sent = send(sock_, eof_marker, strlen(eof_marker), 0);
-              if (sent >= 0) {
-                ABSL_LOG(INFO) << "Early EOF marker sent due to repetition (" << sent << " bytes)";
-              } else {
-                ABSL_LOG(ERROR) << "Failed to send early EOF marker: " << strerror(errno);
-              }
-              closed_ = true;
-              close(sock_);
-              *cancelled_ = true;
-              return;  // Stop sending tokens
-            }
-          } else {
-            repetition_count_ = 0;  // Reset counter on new content
-          }
+          // if (has_repeating_pattern(response_chunk)) {
+          //   repetition_count_++;
+          //   ABSL_LOG(WARNING) << "Repeating pattern detected (" << repetition_count_ << "/" << max_repetitions_ << "): " << response_chunk;
+          //
+          //   if (repetition_count_ >= max_repetitions_) {
+          //     ABSL_LOG(ERROR) << "Too many repeating patterns detected, cancelling inference remotely";
+          //     const char* stop_msg = " [Generation stopped due to repetition]";
+          //     send(sock_, stop_msg, strlen(stop_msg), 0);
+          //     // Send EOF marker immediately to signal client completion
+          //     const char* eof_marker = "\n<END_OF_RESPONSE>\n";
+          //     ssize_t sent = send(sock_, eof_marker, strlen(eof_marker), 0);
+          //     if (sent >= 0) {
+          //       ABSL_LOG(INFO) << "Early EOF marker sent due to repetition (" << sent << " bytes)";
+          //     } else {
+          //       ABSL_LOG(ERROR) << "Failed to send early EOF marker: " << strerror(errno);
+          //     }
+          //     closed_ = true;
+          //     close(sock_);
+          //     *cancelled_ = true;
+          //     return;  // Stop sending tokens
+          //   }
+          // } else {
+          //   repetition_count_ = 0;  // Reset counter on new content
+          // }
 
           // Add characters to recent history
           add_recent_chars(response_chunk);
@@ -104,7 +104,7 @@ namespace {
           ssize_t sent = send(sock_, (*text_or).data(), (*text_or).length(), 0);
           if (sent >= 0) {
             total_bytes_sent_ += sent;
-            ABSL_LOG(INFO) << "Sent " << sent << " bytes to client (total: " << total_bytes_sent_ << " bytes)";
+            // ABSL_LOG(INFO) << "Sent " << sent << " bytes to client (total: " << total_bytes_sent_ << " bytes)";
           } else {
             ABSL_LOG(ERROR) << "Failed to send token to client: " << strerror(errno);
             stop_sending_ = true;
@@ -112,22 +112,6 @@ namespace {
         } else {
           ABSL_LOG(ERROR) << "Failed to get response text: " << text_or.status();
         }
-      }
-
-      // Override OnCompleted to add EOF marker and signal completion
-      void OnCompleted() {
-        if (closed_) return;  // Already closed
-        ABSL_LOG(INFO) << "Streaming completed after " << tokens_sent_ << " tokens (" << total_bytes_sent_ << " bytes total)";
-        ABSL_LOG(INFO) << "Sending EOF marker";
-        const char* eof_marker = "\n<END_OF_RESPONSE>\n";
-        ssize_t sent = send(sock_, eof_marker, strlen(eof_marker), 0);
-        if (sent >= 0) {
-          ABSL_LOG(INFO) << "EOF marker sent successfully (" << sent << " bytes)";
-        } else {
-          ABSL_LOG(ERROR) << "Failed to send EOF marker: " << strerror(errno);
-        }
-        close(sock_);
-        closed_ = true;
       }
 
       // Override OnError for error handling
@@ -218,13 +202,6 @@ namespace {
         return;
       }
 
-      // Check if cancelled remotely before waiting
-      if (cancelled) {
-        ABSL_LOG(INFO) << "Inference cancelled remotely, killing thread early";
-        // Client socket is closed in StreamingObserver
-        return;
-      }
-
       status = llm->WaitUntilDone(kWaitUntilDoneTimeout);
       if (!status.ok()) {
         // Just close connection on timeout without sending error messages
@@ -232,9 +209,8 @@ namespace {
         return;
       }
 
-      // Client socket is closed in StreamingObserver::OnCompleted or OnError
-
-      return;
+      ABSL_LOG(INFO) << "Generation complete";
+      close(client_sock);
     }
 
     absl::Status MainHelper(int argc, char** argv) {
@@ -382,7 +358,6 @@ namespace {
 
       ABSL_LOG(INFO) << "Creating new session for request";
       SessionConfig session_config = SessionConfig::CreateDefault();
-      session_config.GetPromptTemplates();
       absl::StatusOr<std::unique_ptr<Engine::Session>> session_or =
           (*llm)->CreateSession(session_config);
       ABSL_CHECK_OK(session_or) << "Failed to create session";
