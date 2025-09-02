@@ -56,9 +56,11 @@ namespace {
     class StreamingObserver : public litert::lm::InferenceObservable {
      public:
       StreamingObserver(int sock) : sock_(sock), tokens_sent_(0), total_bytes_sent_(0),
-                                       repetition_count_(0), max_repetitions_(3), stop_sending_(false), closed_(false) {
+                                     repetition_count_(0), max_repetitions_(3), stop_sending_(false), closed_(false) {
         recent_chars_.reserve(100);
       }
+
+
 
       // Override OnNext to write tokens incrementally
       void OnNext(const litert::lm::Responses& responses) override {
@@ -74,7 +76,7 @@ namespace {
             ABSL_LOG(WARNING) << "Repeating pattern detected (" << repetition_count_ << "/" << max_repetitions_ << "): " << response_chunk;
 
             if (repetition_count_ >= max_repetitions_) {
-              ABSL_LOG(ERROR) << "Too many repeating patterns detected, stopping generation";
+              ABSL_LOG(ERROR) << "Too many repeating patterns detected, stopping token sending";
               const char* stop_msg = " [Generation stopped due to repetition]";
               send(sock_, stop_msg, strlen(stop_msg), 0);
               // Send EOF marker immediately to signal client completion
@@ -85,9 +87,10 @@ namespace {
               } else {
                 ABSL_LOG(ERROR) << "Failed to send early EOF marker: " << strerror(errno);
               }
+              closed_ = true;
               close(sock_);
               stop_sending_ = true;
-              return;  // Stop sending tokens
+              return;  // Stop sending tokens, let inference finish
             }
           } else {
             repetition_count_ = 0;  // Reset counter on new content
@@ -184,15 +187,16 @@ namespace {
      }
 
      private:
-      int sock_;
-      int tokens_sent_;
-      size_t total_bytes_sent_;
-      std::string recent_chars_;
-      int repetition_count_;
-      const int max_repetitions_;
-      bool stop_sending_;
-      bool closed_;
-    };
+       int sock_;
+       int tokens_sent_;
+       size_t total_bytes_sent_;
+       std::string recent_chars_;
+       int repetition_count_;
+       const int max_repetitions_;
+       bool stop_sending_;
+       bool closed_;
+
+     };
 
     void RunInference(Engine* llm, std::unique_ptr<Engine::Session> session,
                       const std::vector<std::string>& formatted_inputs, int client_sock) {
@@ -205,7 +209,12 @@ namespace {
       StreamingObserver observer(client_sock);
 
       absl::Status status = session->GenerateContentStream(inputs, &observer);
-      ABSL_CHECK_OK(status);
+      if (!status.ok()) {
+        ABSL_LOG(ERROR) << "Failed to start content stream: " << status;
+        close(client_sock);
+        return;
+      }
+
       status = llm->WaitUntilDone(kWaitUntilDoneTimeout);
       if (!status.ok()) {
         // Just close connection on timeout without sending error messages
@@ -370,7 +379,7 @@ namespace {
       std::unique_ptr<Engine::Session> session = std::move(*session_or);
       ABSL_LOG(INFO) << "Session created successfully";
 
-      // Run inference in separate thread to handle new connections immediately
+      // Run inference in separate thread; will be killed on repetition exception
       std::thread inference_thread(RunInference, llm->get(), std::move(session), formatted_inputs, client_sock);
       inference_thread.detach();
 
