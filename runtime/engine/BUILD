@@ -167,6 +167,7 @@ cc_binary(
         "@com_google_absl//absl/strings:string_view",
         "@litert//litert/c:litert_logging",
         "//runtime/util:litert_status_util",
+        "@nlohmann_json//:json",
     ] + select({
         "//conditions:default": ["//runtime/core:engine_impl"],
     }),

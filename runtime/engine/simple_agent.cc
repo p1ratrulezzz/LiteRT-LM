@@ -35,282 +35,327 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <nlohmann/json.hpp>
 
 
 namespace {
 
-using ::litert::lm::Backend;
-using ::litert::lm::Engine;
-using ::litert::lm::EngineSettings;
-using ::litert::lm::InputData;
-using ::litert::lm::InputText;
-using ::litert::lm::ModelAssets;
-using ::litert::lm::SessionConfig;
+    using ::litert::lm::Backend;
+    using ::litert::lm::Engine;
+    using ::litert::lm::EngineSettings;
+    using ::litert::lm::InputData;
+    using ::litert::lm::InputText;
+    using ::litert::lm::ModelAssets;
+    using ::litert::lm::SessionConfig;
+    using json = nlohmann::json;
 
-const absl::Duration kWaitUntilDoneTimeout = absl::Minutes(5);
+    const absl::Duration kWaitUntilDoneTimeout = absl::Minutes(5);
 
-// Custom observer for streaming output
-class StreamingObserver : public litert::lm::InferenceObservable {
- public:
-  StreamingObserver(int sock) : sock_(sock), tokens_sent_(0), total_bytes_sent_(0),
-                               repetition_count_(0), max_repetitions_(3) {
-    recent_tokens_.reserve(10);
-  }
+    // Custom observer for streaming output
+    class StreamingObserver : public litert::lm::InferenceObservable {
+     public:
+      StreamingObserver(int sock) : sock_(sock), tokens_sent_(0), total_bytes_sent_(0),
+                                   repetition_count_(0), max_repetitions_(3) {
+        recent_chars_.reserve(100);
+      }
 
-  // Override OnNext to write tokens incrementally
-  void OnNext(const litert::lm::Responses& responses) override {
-    // Get clean text without metadata
-    auto text_or = responses.GetResponseTextAt(0);
-    if (text_or.ok()) {
-      // Check for repetition to prevent infinite loops
-      if (is_repeating(std::string(*text_or))) {
-        repetition_count_++;
-        ABSL_LOG(WARNING) << "Repetition detected (" << repetition_count_ << "/" << max_repetitions_ << "): " << *text_or;
+      // Override OnNext to write tokens incrementally
+      void OnNext(const litert::lm::Responses& responses) override {
+        // Get clean text without metadata
+        auto text_or = responses.GetResponseTextAt(0);
+        if (text_or.ok()) {
+          // Check for repetition in character patterns to prevent infinite loops
+          std::string response_chunk = std::string(*text_or);
+          if (has_repeating_pattern(response_chunk)) {
+            repetition_count_++;
+            ABSL_LOG(WARNING) << "Repeating pattern detected (" << repetition_count_ << "/" << max_repetitions_ << "): " << response_chunk;
 
-        if (repetition_count_ >= max_repetitions_) {
-          ABSL_LOG(ERROR) << "Too many repetitions detected, stopping generation";
-          const char* stop_msg = " [Generation stopped due to repetition]";
-          send(sock_, stop_msg, strlen(stop_msg), 0);
-          // Force stop by not processing more tokens
-          return;
+            if (repetition_count_ >= max_repetitions_) {
+              ABSL_LOG(ERROR) << "Too many repeating patterns detected, stopping generation";
+              const char* stop_msg = " [Generation stopped due to repetition]";
+              send(sock_, stop_msg, strlen(stop_msg), 0);
+              // Force stop by not processing more tokens
+              return;
+            }
+          } else {
+            repetition_count_ = 0;  // Reset counter on new content
+          }
+
+          // Add characters to recent history
+          add_recent_chars(response_chunk);
+
+          tokens_sent_++;
+          ABSL_LOG(INFO) << "Token #" << tokens_sent_ << " received: " << *text_or;
+          ssize_t sent = send(sock_, (*text_or).data(), (*text_or).length(), 0);
+          if (sent >= 0) {
+            total_bytes_sent_ += sent;
+            ABSL_LOG(INFO) << "Sent " << sent << " bytes to client (total: " << total_bytes_sent_ << " bytes)";
+          } else {
+            ABSL_LOG(ERROR) << "Failed to send token to client: " << strerror(errno);
+          }
+        } else {
+          ABSL_LOG(ERROR) << "Failed to get response text: " << text_or.status();
         }
-      } else {
-        repetition_count_ = 0;  // Reset counter on new content
       }
 
-      // Add token to recent history
-      add_to_recent_tokens(std::string(*text_or));
-
-      tokens_sent_++;
-      ABSL_LOG(INFO) << "Token #" << tokens_sent_ << " received: " << *text_or;
-      ssize_t sent = send(sock_, (*text_or).data(), (*text_or).length(), 0);
-      if (sent >= 0) {
-        total_bytes_sent_ += sent;
-        ABSL_LOG(INFO) << "Sent " << sent << " bytes to client (total: " << total_bytes_sent_ << " bytes)";
-      } else {
-        ABSL_LOG(ERROR) << "Failed to send token to client: " << strerror(errno);
+      // Override OnCompleted to add EOF marker and signal completion
+      void OnCompleted() {
+        ABSL_LOG(INFO) << "Streaming completed after " << tokens_sent_ << " tokens (" << total_bytes_sent_ << " bytes total)";
+        ABSL_LOG(INFO) << "Sending EOF marker";
+        const char* eof_marker = "\n<END_OF_RESPONSE>\n";
+        ssize_t sent = send(sock_, eof_marker, strlen(eof_marker), 0);
+        if (sent >= 0) {
+          ABSL_LOG(INFO) << "EOF marker sent successfully (" << sent << " bytes)";
+        } else {
+          ABSL_LOG(ERROR) << "Failed to send EOF marker: " << strerror(errno);
+        }
       }
-    } else {
-      ABSL_LOG(ERROR) << "Failed to get response text: " << text_or.status();
-    }
-  }
 
-  // Override OnCompleted to add EOF marker and signal completion
-  void OnCompleted() {
-    ABSL_LOG(INFO) << "Streaming completed after " << tokens_sent_ << " tokens (" << total_bytes_sent_ << " bytes total)";
-    ABSL_LOG(INFO) << "Sending EOF marker";
-    const char* eof_marker = "\n<END_OF_RESPONSE>\n";
-    ssize_t sent = send(sock_, eof_marker, strlen(eof_marker), 0);
-    if (sent >= 0) {
-      ABSL_LOG(INFO) << "EOF marker sent successfully (" << sent << " bytes)";
-    } else {
-      ABSL_LOG(ERROR) << "Failed to send EOF marker: " << strerror(errno);
-    }
-  }
+      // Override OnError for error handling
+      void OnError(const absl::Status& status) override {
+        ABSL_LOG(ERROR) << "Streaming error after " << tokens_sent_ << " tokens: " << status;
+        // Just close connection on streaming errors without sending error messages
+        close(sock_);
+      }
 
-  // Override OnError for error handling
-  void OnError(const absl::Status& status) override {
-    ABSL_LOG(ERROR) << "Streaming error after " << tokens_sent_ << " tokens: " << status;
-    // Just close connection on streaming errors without sending error messages
-    close(sock_);
-  }
+    private:
+     bool has_repeating_pattern(const std::string& new_chars) {
+       // Add new characters to recent history first
+       recent_chars_ += new_chars;
 
-private:
- bool is_repeating(const std::string& token) {
-   // Check if token is the same as the last few tokens
-   for (size_t i = 0; i < recent_tokens_.size() && i < 3; ++i) {
-     if (recent_tokens_[recent_tokens_.size() - 1 - i] == token) {
-       return true;
+       // Keep only last 200 characters for better detection
+       const size_t max_history = 200;
+       if (recent_chars_.size() > max_history) {
+         recent_chars_ = recent_chars_.substr(recent_chars_.size() - max_history);
+       }
+
+       // Only check for patterns if we have enough characters
+       if (recent_chars_.size() < 40) {
+         return false;
+       }
+
+       // Check for repeating character sequences of increasing lengths
+       // Start from smaller patterns (sentences) and go up to larger ones
+       for (size_t len = 15; len <= 80 && len <= recent_chars_.size() / 2; len += 5) {
+         std::string last_sequence = recent_chars_.substr(recent_chars_.size() - len);
+         std::string prev_sequence = recent_chars_.substr(recent_chars_.size() - 2 * len, len);
+
+         if (last_sequence == prev_sequence && !last_sequence.empty()) {
+           // Additional check - ensure it's not just punctuation or whitespace
+           bool has_meaningful_content = false;
+           for (char c : last_sequence) {
+             if (isalnum(c)) {
+               has_meaningful_content = true;
+               break;
+             }
+           }
+
+           if (has_meaningful_content) {
+             ABSL_LOG(WARNING) << "Found repeating phrase of length " << len << ": '" << last_sequence.substr(0, 30) << "...'";
+             return true;
+           }
+         }
+       }
+
+       return false;
      }
-   }
-   return false;
- }
 
- void add_to_recent_tokens(const std::string& token) {
-   recent_tokens_.push_back(token);
-   // Keep only last 5 tokens
-   if (recent_tokens_.size() > 5) {
-     recent_tokens_.erase(recent_tokens_.begin());
-   }
- }
+     void add_recent_chars(const std::string& chars) {
+       // This is now handled in has_repeating_pattern for better control
+     }
 
- int sock_;
- int tokens_sent_;
- size_t total_bytes_sent_;
- std::vector<std::string> recent_tokens_;
- int repetition_count_;
- const int max_repetitions_;
-};
+     int sock_;
+     int tokens_sent_;
+     size_t total_bytes_sent_;
+     std::string recent_chars_;
+     int repetition_count_;
+     const int max_repetitions_;
+    };
 
-absl::Status RunInference(Engine* llm, std::unique_ptr<Engine::Session> session,
-                         const std::string& input_prompt, int client_sock) {
-  std::vector<InputData> inputs;
-  inputs.emplace_back(InputText(input_prompt));
+    absl::Status RunInference(Engine* llm, std::unique_ptr<Engine::Session> session,
+                             const std::vector<std::string>& formatted_inputs, int client_sock) {
+      std::vector<InputData> inputs;
+      for (const auto& formatted_input : formatted_inputs) {
+        inputs.emplace_back(InputText(formatted_input));
+      }
 
-  // Use streaming for incremental output
-  StreamingObserver observer(client_sock);
+      // Use streaming for incremental output
+      StreamingObserver observer(client_sock);
 
-  absl::Status status = session->GenerateContentStream(inputs, &observer);
-  ABSL_CHECK_OK(status);
-  status = llm->WaitUntilDone(kWaitUntilDoneTimeout);
-  if (!status.ok()) {
-    // Just close connection on timeout without sending error messages
-    close(client_sock);
-    return absl::OkStatus();
-  }
+      absl::Status status = session->GenerateContentStream(inputs, &observer);
+      ABSL_CHECK_OK(status);
+      status = llm->WaitUntilDone(kWaitUntilDoneTimeout);
+      if (!status.ok()) {
+        // Just close connection on timeout without sending error messages
+        close(client_sock);
+        return absl::OkStatus();
+      }
 
-  // Ensure client socket is closed after inference
-  close(client_sock);
+      // Ensure client socket is closed after inference
+      close(client_sock);
 
-  return absl::OkStatus();
-}
-
-absl::Status MainHelper(int argc, char** argv) {
-  // Set minimal log level to INFO
-  LiteRtSetMinLoggerSeverity(LiteRtGetDefaultLogger(), LITERT_INFO);
-
-  const std::string default_model_path = "../models/gemma3-1b-it-int4.litertlm";
-  std::string model_path = (argc >= 2) ? argv[1] : default_model_path;
-
-  ABSL_LOG(INFO) << "Model path: " << model_path;
-
-  // Check if model file exists
-  std::ifstream model_file(model_path);
-  if (!model_file.good()) {
-    ABSL_LOG(ERROR) << "Model file does not exist or is not accessible: " << model_path;
-    return absl::InvalidArgumentError("Model file not found");
-  }
-  model_file.close();
-
-  ASSIGN_OR_RETURN(ModelAssets model_assets,
-                   ModelAssets::Create(model_path));
-  ABSL_LOG(INFO) << "Model loaded successfully from: " << model_path;
-
-  // Use CPU backend as default
-  Backend backend = Backend::CPU;
-  ABSL_LOG(INFO) << "Using backend: CPU";
-
-  ASSIGN_OR_RETURN(EngineSettings engine_settings,
-                   EngineSettings::CreateDefault(std::move(model_assets), backend));
-
-  ABSL_LOG(INFO) << "Creating engine";
-  absl::StatusOr<std::unique_ptr<Engine>> llm =
-      Engine::CreateEngine(std::move(engine_settings));
-  ABSL_CHECK_OK(llm) << "Failed to create engine";
-  ABSL_LOG(INFO) << "Engine created successfully";
-
-  // Set up socket server
-  const int PORT = 5188;
-  int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (server_fd < 0) {
-    ABSL_LOG(ERROR) << "Socket creation failed";
-    return absl::InternalError("Socket creation failed");
-  }
-
-  struct sockaddr_in address;
-  address.sin_family = AF_INET;
-  address.sin_addr.s_addr = INADDR_ANY;
-  address.sin_port = htons(PORT);
-
-  if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-    ABSL_LOG(ERROR) << "Bind failed";
-    close(server_fd);
-    return absl::InternalError("Bind failed");
-  }
-
-  if (listen(server_fd, 1) < 0) {
-    ABSL_LOG(ERROR) << "Listen failed";
-    close(server_fd);
-    return absl::InternalError("Listen failed");
-  }
-
-  ABSL_LOG(INFO) << "Listening on port 5188";
-
-  // Loop to handle multiple clients
-  while (true) {
-    socklen_t addrlen = sizeof(address);
-    int client_sock = accept(server_fd, (struct sockaddr*)&address, &addrlen);
-    if (client_sock < 0) {
-      ABSL_LOG(ERROR) << "Accept failed";
-      continue;
+      return absl::OkStatus();
     }
 
-    ABSL_LOG(INFO) << "Client connected";
+    absl::Status MainHelper(int argc, char** argv) {
+      // Set minimal log level to INFO
+      LiteRtSetMinLoggerSeverity(LiteRtGetDefaultLogger(), LITERT_INFO);
 
-  // Read prompt from client
-  std::string input_prompt;
-  char buffer[1024];
-  int bytes_read;
-  const size_t MAX_PROMPT_LENGTH = 1024 * 10;  // 10KB limit
-  size_t total_bytes_received = 0;
-  int recv_count = 0;
+      const std::string default_model_path = "../models/gemma3-1b-it-int4.litertlm";
+      std::string model_path = (argc >= 2) ? argv[1] : default_model_path;
 
-  ABSL_LOG(INFO) << "Starting to read prompt from client";
+      ABSL_LOG(INFO) << "Model path: " << model_path;
 
-  while ((bytes_read = recv(client_sock, buffer, sizeof(buffer) - 1, 0)) > 0) {
-    buffer[bytes_read] = '\0';
-    input_prompt += buffer;
-    total_bytes_received += bytes_read;
-    recv_count++;
+      // Check if model file exists
+      std::ifstream model_file(model_path);
+      if (!model_file.good()) {
+        ABSL_LOG(ERROR) << "Model file does not exist or is not accessible: " << model_path;
+        return absl::InvalidArgumentError("Model file not found");
+      }
+      model_file.close();
 
-    ABSL_LOG(INFO) << "Received chunk #" << recv_count << " (" << bytes_read << " bytes): " << std::string(buffer, bytes_read);
+      ASSIGN_OR_RETURN(ModelAssets model_assets,
+                       ModelAssets::Create(model_path));
+      ABSL_LOG(INFO) << "Model loaded successfully from: " << model_path;
 
-    // Prevent infinite reading
-    if (input_prompt.length() > MAX_PROMPT_LENGTH) {
-      ABSL_LOG(WARNING) << "Prompt too long (" << input_prompt.length() << " chars), truncating";
-      input_prompt = input_prompt.substr(0, MAX_PROMPT_LENGTH);
-      break;
+      // Use CPU backend as default
+      Backend backend = Backend::CPU;
+      ABSL_LOG(INFO) << "Using backend: CPU";
+
+      ASSIGN_OR_RETURN(EngineSettings engine_settings,
+                       EngineSettings::CreateDefault(std::move(model_assets), backend));
+
+      ABSL_LOG(INFO) << "Creating engine";
+      absl::StatusOr<std::unique_ptr<Engine>> llm =
+          Engine::CreateEngine(std::move(engine_settings));
+      ABSL_CHECK_OK(llm) << "Failed to create engine";
+      ABSL_LOG(INFO) << "Engine created successfully";
+
+      // Set up socket server
+      const int PORT = 5188;
+      int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+      if (server_fd < 0) {
+        ABSL_LOG(ERROR) << "Socket creation failed";
+        return absl::InternalError("Socket creation failed");
+      }
+
+      struct sockaddr_in address;
+      address.sin_family = AF_INET;
+      address.sin_addr.s_addr = INADDR_ANY;
+      address.sin_port = htons(PORT);
+
+      if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+        ABSL_LOG(ERROR) << "Bind failed";
+        close(server_fd);
+        return absl::InternalError("Bind failed");
+      }
+
+      if (listen(server_fd, 1) < 0) {
+        ABSL_LOG(ERROR) << "Listen failed";
+        close(server_fd);
+        return absl::InternalError("Listen failed");
+      }
+
+      ABSL_LOG(INFO) << "Listening on port 5188";
+
+      // Loop to handle multiple clients
+      while (true) {
+        socklen_t addrlen = sizeof(address);
+        int client_sock = accept(server_fd, (struct sockaddr*)&address, &addrlen);
+        if (client_sock < 0) {
+          ABSL_LOG(ERROR) << "Accept failed";
+          continue;
+        }
+
+        ABSL_LOG(INFO) << "Client connected";
+
+      // Read prompt from client
+      std::string input_prompt;
+      char buffer[1024];
+      int bytes_read;
+      const size_t MAX_PROMPT_LENGTH = 1024 * 10;  // 10KB limit
+      size_t total_bytes_received = 0;
+      int recv_count = 0;
+
+      ABSL_LOG(INFO) << "Starting to read JSON from client";
+
+      while ((bytes_read = recv(client_sock, buffer, sizeof(buffer) - 1, 0)) > 0) {
+        buffer[bytes_read] = '\0';
+        input_prompt += buffer;
+        total_bytes_received += bytes_read;
+        recv_count++;
+
+        ABSL_LOG(INFO) << "Received chunk #" << recv_count << " (" << bytes_read << " bytes): " << std::string(buffer, bytes_read);
+
+        // Prevent infinite reading
+        if (input_prompt.length() > MAX_PROMPT_LENGTH) {
+          ABSL_LOG(WARNING) << "JSON too long (" << input_prompt.length() << " chars), truncating";
+          input_prompt = input_prompt.substr(0, MAX_PROMPT_LENGTH);
+          break;
+        }
+      }
+
+      ABSL_LOG(INFO) << "Finished reading JSON. Total chunks: " << recv_count << ", Total bytes: " << total_bytes_received;
+
+      if (bytes_read < 0) {
+        ABSL_LOG(ERROR) << "Recv failed with error: " << strerror(errno);
+        close(client_sock);
+        continue;  // Continue listening for next client
+      }
+
+      if (input_prompt.empty()) {
+        ABSL_LOG(ERROR) << "Empty JSON received";
+        close(client_sock);
+        return absl::OkStatus();
+      }
+
+      ABSL_LOG(INFO) << "Final processed JSON (length: " << input_prompt.length() << "): " << input_prompt.substr(0, 500) << (input_prompt.length() > 500 ? "..." : "");
+
+      // Parse JSON
+      std::vector<std::string> formatted_inputs;
+      try {
+        json j = json::parse(input_prompt);
+        auto messages = j["messages"];
+        for (const auto& msg : messages) {
+          std::string role = msg["role"];
+          std::string content = msg["content"];
+          std::string full_input;
+          if (role == "user") {
+            full_input = "<start_of_turn>user\n" + content + "<end_of_turn>\n";
+          } else if (role == "assistant") {
+            full_input = "<start_of_turn>model\n" + content + "<end_of_turn>\n";
+          } else {
+            continue; // Ignore other roles
+          }
+          formatted_inputs.push_back(full_input);
+        }
+        if (formatted_inputs.empty()) {
+          ABSL_LOG(ERROR) << "No valid messages found in JSON";
+          close(client_sock);
+          return absl::OkStatus();
+        }
+      } catch (const std::exception& e) {
+        ABSL_LOG(ERROR) << "Error parsing JSON: " << e.what();
+        close(client_sock);
+        return absl::OkStatus();
+      }
+
+      ABSL_LOG(INFO) << "Creating new session for request";
+      SessionConfig session_config = SessionConfig::CreateDefault();
+      session_config.GetPromptTemplates();
+      absl::StatusOr<std::unique_ptr<Engine::Session>> session_or =
+          (*llm)->CreateSession(session_config);
+      ABSL_CHECK_OK(session_or) << "Failed to create session";
+      std::unique_ptr<Engine::Session> session = std::move(*session_or);
+      ABSL_LOG(INFO) << "Session created successfully";
+
+      // Run inference
+      RETURN_IF_ERROR(RunInference(llm->get(), std::move(session), formatted_inputs, client_sock));
+
+      // Client socket is closed in StreamingObserver::OnCompleted or OnError
+      // Continue to next client
+      }
     }
-  }
-
-  ABSL_LOG(INFO) << "Finished reading prompt. Total chunks: " << recv_count << ", Total bytes: " << total_bytes_received;
-
-  // Remove #### marker if present
-  size_t marker_pos = input_prompt.find("####");
-  if (marker_pos != std::string::npos) {
-    ABSL_LOG(INFO) << "#### marker found at position " << marker_pos << ", removing it";
-    input_prompt = input_prompt.substr(0, marker_pos);
-  } else {
-    ABSL_LOG(INFO) << "No #### marker found";
-  }
-
-  if (bytes_read < 0) {
-    ABSL_LOG(ERROR) << "Recv failed with error: " << strerror(errno);
-    close(client_sock);
-    continue;  // Continue listening for next client
-  }
-
-  if (input_prompt.empty()) {
-    ABSL_LOG(ERROR) << "Empty prompt received";
-    close(client_sock);
-    return;
-  }
-
-  ABSL_LOG(INFO) << "Final processed prompt (length: " << input_prompt.length() << "): " << input_prompt.substr(0, 500) << (input_prompt.length() > 500 ? "..." : "");
-
-  // Check for suspicious patterns that might cause crashes
-  if (input_prompt.find('\0') != std::string::npos) {
-    ABSL_LOG(WARNING) << "Null character found in prompt at position: " << input_prompt.find('\0');
-  }
-  if (input_prompt.length() > 10000) {
-    ABSL_LOG(WARNING) << "Very long prompt: " << input_prompt.length() << " characters";
-  }
-
-  ABSL_LOG(INFO) << "Creating new session for request";
-  SessionConfig session_config = SessionConfig::CreateDefault();
-  absl::StatusOr<std::unique_ptr<Engine::Session>> session_or =
-      (*llm)->CreateSession(session_config);
-  ABSL_CHECK_OK(session_or) << "Failed to create session";
-  std::unique_ptr<Engine::Session> session = std::move(*session_or);
-  ABSL_LOG(INFO) << "Session created successfully";
-
-  // Run inference
-  RETURN_IF_ERROR(RunInference(llm->get(), std::move(session), input_prompt, client_sock));
-
-  // Client socket is closed in StreamingObserver::OnCompleted or OnError
-  // Continue to next client
-  }
-}
 
 }  // namespace
 
