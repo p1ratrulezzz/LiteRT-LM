@@ -184,13 +184,13 @@ namespace {
      };
 
     void RunInference(Engine* llm, std::unique_ptr<Engine::Session> session,
-                      const std::vector<std::string>& formatted_inputs, int client_sock) {
+                      const std::string formatted_input, int client_sock) {
       std::atomic<bool> cancelled = false;
 
+      ABSL_LOG(INFO) << "Final prompt sent to model: " << formatted_input;
       std::vector<InputData> inputs;
-      for (const auto& formatted_input : formatted_inputs) {
-        inputs.emplace_back(InputText(formatted_input));
-      }
+      inputs.emplace_back(InputText(formatted_input));
+      ABSL_LOG(INFO) << "Created 1 combined input data item";
 
       // Use streaming for incremental output
       StreamingObserver observer(client_sock, cancelled);
@@ -283,7 +283,7 @@ namespace {
           continue;
         }
 
-        ABSL_LOG(INFO) << "Client connected";
+        ABSL_LOG(INFO) << "Client connected, starting request processing";
 
       // Read prompt from client
       std::string input_prompt;
@@ -328,32 +328,45 @@ namespace {
       ABSL_LOG(INFO) << "Final processed JSON (length: " << input_prompt.length() << "): " << input_prompt.substr(0, 500) << (input_prompt.length() > 500 ? "..." : "");
 
       // Parse JSON
-      std::vector<std::string> formatted_inputs;
+      std::string formatted_input;
+
       try {
-        json j = json::parse(input_prompt);
-        auto messages = j["messages"];
+        ABSL_LOG(INFO) << "Attempting to parse JSON...";
+        json data = json::parse(input_prompt);
+        auto messages = data["messages"];
+        ABSL_LOG(INFO) << "Messages array size: " << messages.size();
+
+        for (size_t i = 0; i < messages.size(); ++i) {
+          auto& msg = messages[i];
+          std::string role = msg["role"];
+          std::string content = msg["content"];
+          ABSL_LOG(INFO) << "Message " << i << ": role='" << role << "', content='" << content.substr(0,50) << "'";
+        }
+
         for (const auto& msg : messages) {
           std::string role = msg["role"];
           std::string content = msg["content"];
+          if (content.empty()) {
+            ABSL_LOG(WARNING) << "Empty content in message, skipping";
+            continue;
+          }
           std::string full_input;
           if (role == "user") {
             full_input = "<start_of_turn>user\n" + content + "<end_of_turn>\n";
           } else if (role == "assistant") {
             full_input = "<start_of_turn>model\n" + content + "<end_of_turn>\n";
           } else {
+            ABSL_LOG(INFO) << "Unknown role '" << role << "', skipping";
             continue; // Ignore other roles
           }
-          formatted_inputs.push_back(full_input);
+          formatted_input += full_input;
+          ABSL_LOG(INFO) << "Formatted input: " << full_input;
         }
-        if (formatted_inputs.empty()) {
-          ABSL_LOG(ERROR) << "No valid messages found in JSON";
-          close(client_sock);
-          return absl::OkStatus();
-        }
+        ABSL_LOG(INFO) << "Parsed " << messages.size() << " messages";
       } catch (const std::exception& e) {
         ABSL_LOG(ERROR) << "Error parsing JSON: " << e.what();
         close(client_sock);
-        return absl::OkStatus();
+        continue;  // Continue loop instead of returning, to keep server running
       }
 
       ABSL_LOG(INFO) << "Creating new session for request";
@@ -365,16 +378,18 @@ namespace {
       ABSL_LOG(INFO) << "Session created successfully";
 
       // Run inference in separate thread; will be killed on repetition exception
-      std::thread inference_thread(RunInference, llm->get(), std::move(session), formatted_inputs, client_sock);
+      ABSL_LOG(INFO) << "Starting inference thread for client";
+      std::thread inference_thread(RunInference, llm->get(), std::move(session), formatted_input, client_sock);
       inference_thread.detach();
 
       // Continue to next client immediately, without waiting for inference to complete
+        }
       }
+
+    }  // namespace
+
+    int main(int argc, char** argv) {
+      ABSL_LOG(INFO) << "Simple agent main started";
+      ABSL_CHECK_OK(MainHelper(argc, argv));
+      return 0;
     }
-
-}  // namespace
-
-int main(int argc, char** argv) {
-  ABSL_CHECK_OK(MainHelper(argc, argv));
-  return 0;
-}
