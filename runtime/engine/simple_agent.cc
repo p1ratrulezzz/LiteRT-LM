@@ -56,7 +56,7 @@ namespace {
     class StreamingObserver : public litert::lm::InferenceObservable {
      public:
       StreamingObserver(int sock) : sock_(sock), tokens_sent_(0), total_bytes_sent_(0),
-                                     repetition_count_(0), max_repetitions_(3), stop_sending_(false) {
+                                       repetition_count_(0), max_repetitions_(3), stop_sending_(false), closed_(false) {
         recent_chars_.reserve(100);
       }
 
@@ -74,9 +74,18 @@ namespace {
             ABSL_LOG(WARNING) << "Repeating pattern detected (" << repetition_count_ << "/" << max_repetitions_ << "): " << response_chunk;
 
             if (repetition_count_ >= max_repetitions_) {
-              ABSL_LOG(ERROR) << "Too many repeating patterns detected, stopping token sending";
+              ABSL_LOG(ERROR) << "Too many repeating patterns detected, stopping generation";
               const char* stop_msg = " [Generation stopped due to repetition]";
               send(sock_, stop_msg, strlen(stop_msg), 0);
+              // Send EOF marker immediately to signal client completion
+              const char* eof_marker = "\n<END_OF_RESPONSE>\n";
+              ssize_t sent = send(sock_, eof_marker, strlen(eof_marker), 0);
+              if (sent >= 0) {
+                ABSL_LOG(INFO) << "Early EOF marker sent due to repetition (" << sent << " bytes)";
+              } else {
+                ABSL_LOG(ERROR) << "Failed to send early EOF marker: " << strerror(errno);
+              }
+              close(sock_);
               stop_sending_ = true;
               return;  // Stop sending tokens
             }
@@ -104,6 +113,7 @@ namespace {
 
       // Override OnCompleted to add EOF marker and signal completion
       void OnCompleted() {
+        if (closed_) return;  // Already closed
         ABSL_LOG(INFO) << "Streaming completed after " << tokens_sent_ << " tokens (" << total_bytes_sent_ << " bytes total)";
         ABSL_LOG(INFO) << "Sending EOF marker";
         const char* eof_marker = "\n<END_OF_RESPONSE>\n";
@@ -114,13 +124,17 @@ namespace {
           ABSL_LOG(ERROR) << "Failed to send EOF marker: " << strerror(errno);
         }
         close(sock_);
+        closed_ = true;
       }
 
       // Override OnError for error handling
       void OnError(const absl::Status& status) override {
         ABSL_LOG(ERROR) << "Streaming error after " << tokens_sent_ << " tokens: " << status;
         // Just close connection on streaming errors without sending error messages
-        close(sock_);
+        if (!closed_) {
+          close(sock_);
+          closed_ = true;
+        }
       }
 
     private:
@@ -169,17 +183,19 @@ namespace {
        // This is now handled in has_repeating_pattern for better control
      }
 
-     int sock_;
-     int tokens_sent_;
-     size_t total_bytes_sent_;
-     std::string recent_chars_;
-     int repetition_count_;
-     const int max_repetitions_;
-     bool stop_sending_;
+     private:
+      int sock_;
+      int tokens_sent_;
+      size_t total_bytes_sent_;
+      std::string recent_chars_;
+      int repetition_count_;
+      const int max_repetitions_;
+      bool stop_sending_;
+      bool closed_;
     };
 
-    absl::Status RunInference(Engine* llm, std::unique_ptr<Engine::Session> session,
-                             const std::vector<std::string>& formatted_inputs, int client_sock) {
+    void RunInference(Engine* llm, std::unique_ptr<Engine::Session> session,
+                      const std::vector<std::string>& formatted_inputs, int client_sock) {
       std::vector<InputData> inputs;
       for (const auto& formatted_input : formatted_inputs) {
         inputs.emplace_back(InputText(formatted_input));
@@ -194,12 +210,12 @@ namespace {
       if (!status.ok()) {
         // Just close connection on timeout without sending error messages
         close(client_sock);
-        return absl::OkStatus();
+        return;
       }
 
       // Client socket is closed in StreamingObserver::OnCompleted or OnError
 
-      return absl::OkStatus();
+      return;
     }
 
     absl::Status MainHelper(int argc, char** argv) {
