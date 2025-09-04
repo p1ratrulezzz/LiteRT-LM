@@ -217,7 +217,7 @@ substr(0, 30) << "...'";
         // Set minimal log level to INFO
         LiteRtSetMinLoggerSeverity(LiteRtGetDefaultLogger(), LITERT_INFO);
 
-        const std::string default_model_path = "/mnt/data/hosts/localai2.loc/models/gemma3-1b-it-int4.litertlm";
+        const std::string default_model_path = "../models/gemma3-1b-it-int4.litertlm";
         std::string model_path = (argc >= 2) ? argv[1] : default_model_path;
 
         ABSL_LOG(INFO) << "Model path: " << model_path;
