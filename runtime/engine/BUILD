@@ -156,7 +156,17 @@ cc_test(
 cc_binary(
     name = "simple_agent",
     srcs = ["simple_agent.cc"],
-    linkopts = ["-lpthread"],
+    linkopts = select({
+       "@litert//litert:litert_link_capi_so": [],
+       # Export LiteRt* symbols for LiteRt accelerator shlibs.
+       "@platforms//os:ios": ["-Wl,-exported_symbol,_LiteRt*"],
+       "@platforms//os:macos": ["-Wl,-exported_symbol,_LiteRt*"],
+       "@platforms//os:windows": [],
+       "//conditions:default": ["-Wl,--export-dynamic-symbol=LiteRt*"],
+   }) + select({
+       "@platforms//os:android": ["-lEGL", "-lGLESv3"],
+       "//conditions:default": [],
+   }),
     deps = [
         ":engine_interface",
         ":engine_settings",
